@@ -1,0 +1,96 @@
+name: Build K40 alioth ReSukiSU Kernel
+
+on:
+  workflow_dispatch:
+  # push:
+  #   branches: [ master ]
+
+env:
+  # ========= 你需要修改这里 =========
+  KERNEL_REPO: "https://github.com/lhy52370/android_kernel_xiaomi_alioth.git"
+  KERNEL_BRANCH: "master"
+  DEFCONFIG: "alioth_defconfig"
+  LLVM_VERSION: "21.1.8"
+  AK3_REPO: "https://github.com/osm0sis/AnyKernel3.git"
+  # =================================
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential libssl-dev bc flex bison dwarves git zip unzip curl wget tar xz-utils cpio rsync python3 python3-pip python-is-python3 make cmake openjdk-17-jdk ccache lzop zstd libncurses-dev libffi-dev libbz2-dev gnupg jq parallel pigz
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: alioth-resukisu-ccache
+          max-size: 20G
+
+      - name: Download x86_64 LLVM Clang 21 Toolchain
+        run: |
+          mkdir -p toolchain
+          curl -L --retry 5 --retry-delay 3 --connect-timeout 60 \
+          -o toolchain/LLVM.tar.xz \
+          "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/clang+llvm-${LLVM_VERSION}-x86_64-linux-gnu-ubuntu-22.04.tar.xz"
+          tar -Jxf toolchain/LLVM.tar.xz -C toolchain
+          export PATH="$PWD/toolchain/clang+llvm-${LLVM_VERSION}-x86_64-linux-gnu-ubuntu-22.04/bin:$PATH"
+          clang -v
+
+      - name: Clone Kernel Source
+        run: |
+          git clone -b ${KERNEL_BRANCH} --depth=1 --retry=5 ${KERNEL_REPO}
+          cd android_kernel_xiaomi_alioth
+          touch .scmversion
+          sed -i 's/^EXTRAVERSION =.\*/EXTRAVERSION =/' Makefile
+
+      - name: Integrate ReSukiSU
+        run: |
+          cd android_kernel_xiaomi_alioth
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s main
+
+      - name: Patch alioth_defconfig (ReSukiSU config + LTO THIN)
+        run: |
+          cd android_kernel_xiaomi_alioth
+          cat >> arch/arm64/configs/${DEFCONFIG} <<EOF
+CONFIG_KSU=y
+CONFIG_KSU_TOOLKIT_SUPPORT=y
+CONFIG_KSU_MULTI_MANAGER_SUPPORT=y
+CONFIG_KSU_TRACEPOINT_HOOK=y
+EOF
+          sed -i 's/CONFIG_LTO_FULL=y/CONFIG_LTO_THIN=y/g' arch/arm64/configs/${DEFCONFIG}
+
+      - name: Make Defconfig
+        run: |
+          cd android_kernel_xiaomi_alioth
+          export PATH="$PWD/../toolchain/clang+llvm-${LLVM_VERSION}-x86_64-linux-gnu-ubuntu-22.04/bin:$PATH"
+          make LLVM=1 LLVM_IAS=1 ARCH=arm64 CC="ccache clang" HOSTCC="ccache clang" HOSTCXX="ccache clang++" PYTHON=python3 O=out ${DEFCONFIG}
+
+      - name: Build Kernel
+        run: |
+          cd android_kernel_xiaomi_alioth
+          export PATH="$PWD/../toolchain/clang+llvm-${LLVM_VERSION}-x86_64-linux-gnu-ubuntu-22.04/bin:$PATH"
+          make LLVM=1 LLVM_IAS=1 ARCH=arm64 CC="ccache clang" HOSTCC="ccache clang" HOSTCXX="ccache clang++" PYTHON=python3 O=out KCFLAGS=-Wno-error -j$(nproc --all)
+
+      - name: Pack AnyKernel3
+        run: |
+          git clone --depth=1 --retry=5 ${AK3_REPO}
+          cd AnyKernel3
+          cp ../android_kernel_xiaomi_alioth/out/arch/arm64/boot/Image ./Image
+          # 修改anykernel.sh，开启设备匹配，alioth
+          sed -i 's/^device_name=.*/device_name=alioth/' anykernel.sh
+          sed -i 's/^block=.*/block=auto/' anykernel.sh
+          zip -r9 K40-alioth-ReSukiSU-AK3.zip . -x .git*
+
+      - name: Upload AK3 Flashable Zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: K40-alioth-ReSukiSU-AK3
+          path: AnyKernel3/K40-alioth-ReSukiSU-AK3.zip
+          if-no-files-found: error
